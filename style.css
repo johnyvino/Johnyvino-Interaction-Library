@@ -527,6 +527,13 @@ body.sidebar-open .mob-trigger {
   pointer-events: none;
 }
 
+@media (max-width: 768px) {
+  .card-thumb::before {
+    background: var(--surface-card);
+    animation: none;
+  }
+}
+
 @keyframes shimmer {
   from { background-position: -200% 0; }
   to   { background-position:  200% 0; }
