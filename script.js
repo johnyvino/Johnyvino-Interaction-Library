@@ -346,7 +346,6 @@
       target.scrollIntoView({ behavior: 'smooth', block: 'start' });
       history.pushState(null, '', `#${link.dataset.section}`);
       scrollTimer = setTimeout(() => { scrollingFromClick = false; }, 1000);
-      setTimeout(() => target.scrollIntoView({ behavior: 'smooth', block: 'start' }), 600);
       closeSidebar();
     });
   });
@@ -459,8 +458,10 @@
 
   const lb      = document.getElementById('lightbox');
   const lbVideo = document.getElementById('lightbox-video');
+  let lbCleanupTimer = null;
 
   function openLightbox(src, title) {
+    clearTimeout(lbCleanupTimer);
     lbVideo.src = src;
     lbVideo.play().catch(() => {});
     lb.classList.add('open');
@@ -476,7 +477,7 @@
     lbVideo.style.transform = '';
     lb.style.opacity = '';
     lbVideo.pause();
-    setTimeout(() => { lbVideo.removeAttribute('src'); lbVideo.load(); }, 300);
+    lbCleanupTimer = setTimeout(() => { lbVideo.removeAttribute('src'); lbVideo.load(); }, 300);
     unlockScroll();
   }
 
