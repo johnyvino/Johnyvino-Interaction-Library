@@ -279,9 +279,6 @@
     const grid = document.createElement('div');
     grid.className = 'card-grid';
 
-    const isMobile = window.matchMedia('(max-width: 768px)').matches;
-    const preloadMode = isMobile ? 'metadata' : 'none';
-
     cat.files.forEach((file, i) => {
       const t = titleFromPath(file);
       const title = t || `${cat.name} ${String(i + 1).padStart(2, '0')}`;
@@ -289,7 +286,7 @@
       card.className = 'card';
       card.innerHTML =
         `<div class="card-thumb">` +
-        `<video loop muted playsinline preload="${preloadMode}">` +
+        `<video loop muted playsinline preload="none">` +
         `<source src="${encodeURI(file)}" type="video/mp4">` +
         `</video>` +
         `</div>` +
@@ -312,12 +309,7 @@
 
   document.querySelectorAll('.card-thumb video').forEach(v => {
     videoObserver.observe(v);
-    const thumb = v.closest('.card-thumb');
-    const markLoaded = () => thumb.classList.add('loaded');
-    v.addEventListener('canplay', markLoaded);
-    v.addEventListener('loadedmetadata', markLoaded);
-    v.addEventListener('loadeddata', markLoaded);
-    setTimeout(markLoaded, 4000);
+    v.addEventListener('canplay', () => v.closest('.card-thumb').classList.add('loaded'));
   });
 
   // ── SCROLL SPY ────────────────────────────────────────────────────────────
