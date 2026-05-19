@@ -83,6 +83,13 @@
     const publishBtn     = $('publishBtn');
     const statusEl       = $('status');
 
+    const tabAdd        = $('tabAdd');
+    const tabManage     = $('tabManage');
+    const manageList    = $('manageList');
+    const manageSearch  = $('manageSearch');
+    const manageCount   = $('manageCount');
+    const manageStatus  = $('manageStatus');
+
     // -------- State --------
     let token         = localStorage.getItem(TOKEN_KEY) || '';
     let pickedFile    = null;
@@ -90,6 +97,13 @@
     let posterBlob    = null;       // first-frame JPEG, generated client-side
     let videoMeta     = { w: 0, h: 0, duration: 0 };
     let existingPaths = new Set();  // every Assets/.../*.mp4 already in script.js
+
+    // Parsed snapshot of script.js, used by the Manage view.
+    /** @type {{ id:string, name:string, color:string, files:Array<{path:string,slug:string,key1:string,key2:string,title:string,isOverride:boolean}> }[]} */
+    let parsedCategories = [];
+    /** @type {Record<string,string>} */
+    let parsedOverrides = {};
+    let manageBuilt = false;
 
     // -------- Helpers --------
     const fmtKB = (n) => `${Math.max(1, Math.round(n / 1024))} kB`;
@@ -277,13 +291,56 @@
     async function loadExistingScript() {
         const res = await gh(repoPath(`/contents/script.js?ref=${BRANCH}`));
         const text = decodeBase64Utf8(res.content);
+        const parsed = parseScript(text);
+        parsedCategories = parsed.categories;
+        parsedOverrides  = parsed.overrides;
         // Pull every quoted Assets/... path so we can dedupe on slug collisions.
         existingPaths = new Set();
-        const re = /['"](Assets\/[^'"]+\.mp4)['"]/g;
-        let m;
-        while ((m = re.exec(text)) !== null) existingPaths.add(m[1]);
+        for (const cat of parsedCategories) {
+            for (const f of cat.files) existingPaths.add(f.path);
+        }
         updatePathPreview();
+        if (manageBuilt) renderManageList();
         return { text, sha: res.sha };
+    }
+
+    /**
+     * Parse script.js into the same structure the public site uses, plus the
+     * titleOverrides map. The Manage view renders from this; mutations
+     * re-fetch script.js to make sure we patch the latest content.
+     */
+    function parseScript(text) {
+        const overrides = {};
+        const block = /const titleOverrides\s*=\s*\{([\s\S]*?)\n\s*\};/.exec(text);
+        if (block) {
+            const re = /['"]([^'"]+)['"]\s*:\s*['"]([^'"]*)['"]/g;
+            let m;
+            while ((m = re.exec(block[1])) !== null) overrides[m[1]] = m[2];
+        }
+
+        const categories = [];
+        const catRe = /\{\s*id:\s*['"](\w+)['"]\s*,\s*name:\s*['"]([^'"]+)['"]\s*,\s*color:\s*['"]([^'"]+)['"]\s*,\s*files:\s*\[([\s\S]*?)\]\s*\}/g;
+        let m;
+        while ((m = catRe.exec(text)) !== null) {
+            const [, id, name, color, filesBlock] = m;
+            const files = [];
+            const fileRe = /['"]([^'"]+\.mp4)['"]/g;
+            let fm;
+            while ((fm = fileRe.exec(filesBlock)) !== null) {
+                const path = fm[1];
+                const slug = path.split('/').pop().replace(/\.mp4$/i, '');
+                const key1 = slug.replace(/^[a-f0-9]{6,}_/, '').replace(/~mv2$/, '');
+                const key2 = key1.replace(/^\d+-/, '');
+                let title, isOverride = false;
+                if (overrides[key1] !== undefined)      { title = overrides[key1]; isOverride = true; }
+                else if (overrides[key2] !== undefined) { title = overrides[key2]; isOverride = true; }
+                else if (/^[a-f0-9]{16,}$/.test(key1))  { title = ''; }
+                else { title = key2.replace(/[-_.]+/g, ' ').trim().replace(/\b\w/g, c => c.toUpperCase()); }
+                files.push({ path, slug, key1, key2, title, isOverride });
+            }
+            categories.push({ id, name, color, files });
+        }
+        return { categories, overrides };
     }
 
     // -------- script.js editing --------
@@ -362,6 +419,60 @@
         const key = `'${slug.replace(/'/g, "\\'")}'`;
         const val = `'${customTitle.replace(/'/g, "\\'")}'`;
         const line = `    ${key}: ${val},\n`;
+        return text.replace(marker, `$1${line}`);
+    }
+
+    /**
+     * Remove a `'<path>',` line from any category's files array.
+     * Returns the new text, or throws if the path isn't found.
+     */
+    function removeFilePath(text, path) {
+        const lit = `'${path.replace(/'/g, "\\'")}'`;
+        // Match the whole indented line with optional trailing comma.
+        const lineRe = new RegExp(`[ \\t]*${escapeRegExp(lit)}\\s*,?[ \\t]*\\n`);
+        if (!lineRe.test(text)) {
+            throw new Error(`Path not found in script.js: ${path}`);
+        }
+        return text.replace(lineRe, '');
+    }
+
+    /**
+     * Remove any titleOverrides entry whose key matches one of `keys`.
+     * Silently no-ops when no entry matches — useful for both delete-flow
+     * cleanup and "title reverted to auto" edits.
+     */
+    function removeTitleOverrides(text, keys) {
+        let out = text;
+        for (const k of keys) {
+            if (!k) continue;
+            const lineRe = new RegExp(
+                `[ \\t]*['"]${escapeRegExp(k)}['"]\\s*:\\s*['"][^'"]*['"]\\s*,?[ \\t]*\\n`
+            );
+            out = out.replace(lineRe, '');
+        }
+        return out;
+    }
+
+    /**
+     * Set or replace a titleOverrides entry. If an entry already exists
+     * for `key1` or `key2`, its value is replaced in place; otherwise a
+     * new entry keyed on `preferredKey` is inserted near the top.
+     */
+    function setTitleOverride(text, preferredKey, key1, key2, title) {
+        const escTitle = title.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+        const newVal = `'${escTitle}'`;
+        for (const k of [key1, key2]) {
+            if (!k) continue;
+            const inPlace = new RegExp(
+                `(['"]${escapeRegExp(k)}['"]\\s*:\\s*)['"][^'"]*['"]`
+            );
+            if (inPlace.test(text)) return text.replace(inPlace, `$1${newVal}`);
+        }
+        // No existing entry — insert near top of the block.
+        const marker = /(const titleOverrides = \{\s*\n)/;
+        if (!marker.test(text)) return text;
+        const escKey = preferredKey.replace(/'/g, "\\'");
+        const line = `    '${escKey}': ${newVal},\n`;
         return text.replace(marker, `$1${line}`);
     }
 
@@ -681,5 +792,306 @@
             body: JSON.stringify({ content: base64Content, encoding: 'base64' }),
         });
         return res.sha;
+    }
+
+    // -------- Tabs --------
+    function setActiveTab(view) {
+        for (const btn of [tabAdd, tabManage]) {
+            btn.classList.toggle('is-active', btn.dataset.view === view);
+            btn.setAttribute('aria-selected', btn.dataset.view === view ? 'true' : 'false');
+        }
+        for (const sec of document.querySelectorAll('.admin-view')) {
+            sec.classList.toggle('is-active', sec.dataset.view === view);
+        }
+        if (view === 'manage' && !manageBuilt) {
+            manageBuilt = true;
+            renderManageList();
+        }
+    }
+    tabAdd.addEventListener('click',    () => setActiveTab('add'));
+    tabManage.addEventListener('click', () => setActiveTab('manage'));
+
+    // -------- Manage view: render --------
+    function setManageStatus(text, kind) {
+        manageStatus.textContent = text || '';
+        manageStatus.classList.remove('is-success', 'is-error');
+        if (kind) manageStatus.classList.add(`is-${kind}`);
+    }
+
+    function renderManageList() {
+        if (!parsedCategories.length) {
+            manageList.innerHTML = '<p class="admin-manage-empty">No categories parsed from script.js — refresh and try again.</p>';
+            manageCount.textContent = '0 items';
+            return;
+        }
+        const total = parsedCategories.reduce((n, c) => n + c.files.length, 0);
+        manageCount.textContent = `${total} item${total === 1 ? '' : 's'}`;
+
+        const html = parsedCategories.map((cat) => {
+            const items = cat.files.map((f, idx) => itemHTML(cat, f, idx)).join('');
+            return `
+                <section class="admin-cat-block" data-cat="${esc(cat.id)}">
+                    <header class="admin-cat-header">
+                        <h3 class="admin-cat-name">${esc(cat.name)}</h3>
+                        <span class="admin-cat-tally">${cat.files.length}</span>
+                    </header>
+                    <div class="admin-cat-grid">${items}</div>
+                </section>
+            `;
+        }).join('');
+        manageList.innerHTML = html;
+        applyManageFilter();
+    }
+
+    function itemHTML(cat, f, idx) {
+        const posterPath = f.path.replace(/\.mp4$/i, '.jpg');
+        const titleHTML = f.title
+            ? esc(f.title)
+            : `<em>(untitled)</em>`;
+        const haystack = `${f.title} ${f.slug} ${cat.name} ${cat.id}`.toLowerCase();
+        return `
+            <div class="admin-item" data-cat="${esc(cat.id)}" data-idx="${idx}" data-haystack="${esc(haystack)}">
+                <div class="admin-item-thumb">
+                    <img src="${esc(posterPath)}" alt="" loading="lazy"
+                         onerror="this.style.display='none'">
+                </div>
+                <div class="admin-item-body">
+                    <div class="admin-item-title-block">
+                        <div class="admin-item-title">${titleHTML}</div>
+                        <div class="admin-item-slug">${esc(f.slug)}</div>
+                        ${f.isOverride ? '<span class="admin-item-override">Override</span>' : ''}
+                    </div>
+                </div>
+                <div class="admin-item-actions">
+                    <button type="button" class="admin-item-btn admin-item-btn--edit"
+                            data-action="edit" data-cat="${esc(cat.id)}" data-idx="${idx}">Edit</button>
+                    <button type="button" class="admin-item-btn admin-item-btn--danger"
+                            data-action="delete" data-cat="${esc(cat.id)}" data-idx="${idx}">Delete</button>
+                </div>
+            </div>
+        `;
+    }
+
+    function applyManageFilter() {
+        const q = manageSearch.value.trim().toLowerCase();
+        let visible = 0;
+        for (const block of manageList.querySelectorAll('.admin-cat-block')) {
+            let blockVisible = 0;
+            for (const item of block.querySelectorAll('.admin-item')) {
+                const match = !q || item.dataset.haystack.includes(q);
+                item.style.display = match ? '' : 'none';
+                if (match) { blockVisible++; visible++; }
+            }
+            block.style.display = blockVisible ? '' : 'none';
+        }
+        if (q) manageCount.textContent = `${visible} match${visible === 1 ? '' : 'es'}`;
+        else {
+            const total = parsedCategories.reduce((n, c) => n + c.files.length, 0);
+            manageCount.textContent = `${total} item${total === 1 ? '' : 's'}`;
+        }
+    }
+    manageSearch.addEventListener('input', applyManageFilter);
+
+    // -------- Manage view: actions --------
+    function findItem(catId, idx) {
+        const cat = parsedCategories.find(c => c.id === catId);
+        if (!cat) return null;
+        const file = cat.files[idx];
+        if (!file) return null;
+        return { cat, file, idx };
+    }
+
+    manageList.addEventListener('click', (e) => {
+        const btn = e.target.closest('button[data-action]');
+        if (!btn) return;
+        const action = btn.dataset.action;
+        const itemEl = btn.closest('.admin-item');
+        const ref = findItem(btn.dataset.cat, parseInt(btn.dataset.idx, 10));
+        if (!ref) return;
+        if (action === 'edit')   beginEditTitle(itemEl, ref);
+        if (action === 'delete') confirmDelete(itemEl, ref);
+    });
+
+    function beginEditTitle(itemEl, ref) {
+        if (itemEl.querySelector('.admin-item-edit')) return; // already editing
+        const titleBlock = itemEl.querySelector('.admin-item-title-block');
+        const current = ref.file.title || '';
+        titleBlock.innerHTML = `
+            <div class="admin-item-edit">
+                <input type="text" value="${esc(current)}" placeholder="Title (leave blank to revert)" autocomplete="off">
+                <div class="admin-item-edit-row">
+                    <button type="button" class="admin-item-btn admin-item-btn--save">Save</button>
+                    <button type="button" class="admin-item-btn admin-item-btn--cancel">Cancel</button>
+                </div>
+            </div>
+        `;
+        const input = titleBlock.querySelector('input');
+        input.focus();
+        input.select();
+        const cancel = () => renderManageList();
+        titleBlock.querySelector('.admin-item-btn--cancel').addEventListener('click', cancel);
+        titleBlock.querySelector('.admin-item-btn--save').addEventListener('click', () => {
+            const newTitle = input.value.trim();
+            saveEditTitle(itemEl, ref, newTitle);
+        });
+        input.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') cancel();
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                saveEditTitle(itemEl, ref, input.value.trim());
+            }
+        });
+    }
+
+    async function saveEditTitle(itemEl, ref, newTitle) {
+        // Auto-derived title for this slug, ignoring any current override.
+        const auto = ref.file.key2
+            .replace(/[-_.]+/g, ' ')
+            .trim()
+            .replace(/\b\w/g, c => c.toUpperCase());
+        // No-op if the user didn't actually change anything visible.
+        if (newTitle === ref.file.title) {
+            renderManageList();
+            return;
+        }
+        itemEl.classList.add('is-busy');
+        setManageStatus('Saving…');
+        try {
+            await commitScriptEdit(`Update title: ${ref.cat.name} · ${newTitle || auto || ref.file.slug}`, (text) => {
+                if (!newTitle || newTitle === auto) {
+                    return removeTitleOverrides(text, [ref.file.key1, ref.file.key2]);
+                }
+                return setTitleOverride(text, ref.file.key2 || ref.file.key1, ref.file.key1, ref.file.key2, newTitle);
+            });
+            await loadExistingScript();
+            setManageStatus('Title saved.', 'success');
+        } catch (err) {
+            handleManageError(err);
+        } finally {
+            itemEl.classList.remove('is-busy');
+        }
+    }
+
+    function confirmDelete(itemEl, ref) {
+        const label = ref.file.title || ref.file.slug;
+        if (!window.confirm(`Delete "${label}" from ${ref.cat.name}?\n\nThis removes the .mp4 and poster .jpg from the repo and the entry from script.js.`)) {
+            return;
+        }
+        deleteItem(itemEl, ref);
+    }
+
+    async function deleteItem(itemEl, ref) {
+        itemEl.classList.add('is-busy');
+        setManageStatus('Deleting…');
+        try {
+            const posterPath = ref.file.path.replace(/\.mp4$/i, '.jpg');
+            await commitDelete(
+                `Remove ${ref.cat.name} interaction: ${ref.file.title || ref.file.slug}`,
+                ref.file.path,
+                posterPath,
+                ref.file
+            );
+            await loadExistingScript();
+            setManageStatus('Deleted.', 'success');
+        } catch (err) {
+            handleManageError(err);
+        } finally {
+            itemEl.classList.remove('is-busy');
+        }
+    }
+
+    function handleManageError(err) {
+        if (err.isAuth) {
+            localStorage.removeItem(TOKEN_KEY);
+            token = '';
+            showGate('Token rejected. Paste a fresh one.');
+            return;
+        }
+        setManageStatus(err.message, 'error');
+    }
+
+    /**
+     * Atomic commit that only changes script.js. The mutate() callback
+     * receives the latest text and returns the new text.
+     */
+    async function commitScriptEdit(message, mutate) {
+        const ref = await gh(repoPath(`/git/refs/heads/${BRANCH}`));
+        const parentSha = ref.object.sha;
+        const parentCommit = await gh(repoPath(`/git/commits/${parentSha}`));
+        const baseTreeSha = parentCommit.tree.sha;
+
+        const scriptRes = await gh(repoPath(`/contents/script.js?ref=${BRANCH}`));
+        const oldText = decodeBase64Utf8(scriptRes.content);
+        const newText = mutate(oldText);
+        if (newText === oldText) return; // nothing to do
+
+        const scriptSha = await uploadBlob(encodeUtf8Base64(newText));
+        const tree = await gh(repoPath('/git/trees'), {
+            method: 'POST',
+            body: JSON.stringify({
+                base_tree: baseTreeSha,
+                tree: [{ path: 'script.js', mode: '100644', type: 'blob', sha: scriptSha }],
+            }),
+        });
+        const commit = await gh(repoPath('/git/commits'), {
+            method: 'POST',
+            body: JSON.stringify({ message, tree: tree.sha, parents: [parentSha] }),
+        });
+        await gh(repoPath(`/git/refs/heads/${BRANCH}`), {
+            method: 'PATCH',
+            body: JSON.stringify({ sha: commit.sha, force: false }),
+        });
+    }
+
+    /**
+     * Atomic commit that removes a video + poster from the tree and patches
+     * script.js to drop the file path and any matching titleOverrides entry.
+     */
+    async function commitDelete(message, mp4Path, posterPath, fileRef) {
+        const ref = await gh(repoPath(`/git/refs/heads/${BRANCH}`));
+        const parentSha = ref.object.sha;
+        const parentCommit = await gh(repoPath(`/git/commits/${parentSha}`));
+        const baseTreeSha = parentCommit.tree.sha;
+
+        const scriptRes = await gh(repoPath(`/contents/script.js?ref=${BRANCH}`));
+        let scriptText = decodeBase64Utf8(scriptRes.content);
+        scriptText = removeFilePath(scriptText, mp4Path);
+        scriptText = removeTitleOverrides(scriptText, [fileRef.key1, fileRef.key2]);
+
+        // Check whether the poster file actually exists in the tree before
+        // including a delete entry — passing sha:null for a missing path
+        // makes the tree call fail.
+        const posterExists = await fileExists(posterPath);
+
+        const scriptSha = await uploadBlob(encodeUtf8Base64(scriptText));
+        const treeEntries = [
+            { path: mp4Path,    mode: '100644', type: 'blob', sha: null },
+            { path: 'script.js', mode: '100644', type: 'blob', sha: scriptSha },
+        ];
+        if (posterExists) {
+            treeEntries.push({ path: posterPath, mode: '100644', type: 'blob', sha: null });
+        }
+        const tree = await gh(repoPath('/git/trees'), {
+            method: 'POST',
+            body: JSON.stringify({ base_tree: baseTreeSha, tree: treeEntries }),
+        });
+        const commit = await gh(repoPath('/git/commits'), {
+            method: 'POST',
+            body: JSON.stringify({ message, tree: tree.sha, parents: [parentSha] }),
+        });
+        await gh(repoPath(`/git/refs/heads/${BRANCH}`), {
+            method: 'PATCH',
+            body: JSON.stringify({ sha: commit.sha, force: false }),
+        });
+    }
+
+    async function fileExists(path) {
+        try {
+            await gh(repoPath(`/contents/${encodeURI(path)}?ref=${BRANCH}`));
+            return true;
+        } catch (err) {
+            if (err.isAuth) throw err;
+            return false;
+        }
     }
 })();

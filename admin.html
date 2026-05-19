@@ -58,8 +58,14 @@
     </div>
   </section>
 
-  <!-- Main form -->
+  <!-- Main app: tabbed Add / Manage -->
   <section class="admin-main" id="adminMain">
+    <nav class="admin-tabs" role="tablist">
+      <button type="button" class="admin-tab is-active" role="tab" data-view="add" id="tabAdd">Add</button>
+      <button type="button" class="admin-tab" role="tab" data-view="manage" id="tabManage">Manage</button>
+    </nav>
+
+    <div class="admin-view is-active" data-view="add">
     <form id="itemForm" class="admin-grid" novalidate>
       <!-- Left: live card preview -->
       <div class="admin-col admin-col-image">
@@ -147,6 +153,19 @@
         </div>
       </div>
     </form>
+    </div><!-- /.admin-view[data-view=add] -->
+
+    <div class="admin-view" data-view="manage">
+      <div class="admin-manage-toolbar">
+        <input type="search" id="manageSearch" class="admin-manage-search"
+               placeholder="Search by title, slug, or category…" autocomplete="off">
+        <span class="admin-manage-count" id="manageCount">—</span>
+        <span class="admin-status" id="manageStatus"></span>
+      </div>
+      <div id="manageList" class="admin-manage-list" aria-live="polite">
+        <p class="admin-manage-empty">Loading items…</p>
+      </div>
+    </div><!-- /.admin-view[data-view=manage] -->
   </section>
 
   <script src="admin.js" defer></script>
