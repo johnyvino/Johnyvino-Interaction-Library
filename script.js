@@ -160,6 +160,7 @@
         'Assets/Utilities/5c6e531a9de596970db4704a_wash.mp4',
         'Assets/Utilities/5c772584ef196871c6bdaa68_2-aircondition1.mp4',
         'Assets/checklist-card.mp4',
+        'Assets/MISCELLANEOUS/shop.mp4',
       ]
     },
   ];
